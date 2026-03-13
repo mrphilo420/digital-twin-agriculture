@@ -1,3 +1,4 @@
+```markdown
 # 🌾 Agricultural Digital Twin: 5D Spatiotemporal Soil Nutrient Engine
 
 [![R Status](https://img.shields.io/badge/R-4.0+-blue.svg)](https://cran.r-project.org/)
@@ -27,3 +28,76 @@ The engine is built entirely in R. It relies on `imager` (C++ backend) for massi
 
 ```r
 install.packages(c("ggplot2", "reshape2", "MASS", "xtable", "viridis", "imager"))
+```
+
+For the Ensemble Kalman Filter demonstration, the `MASS` package is required (already included).
+
+---
+
+## 💻 Quickstart
+
+Clone the repository and run the master script. It will:
+
+1. Set up a $200 \times 200 \times 3$ heterogeneous soil buffering map.
+2. Execute a baseline 3‑year corn–soybean–wheat rotation.
+3. Execute a continuous corn (monoculture) scenario for comparison.
+4. Compute depth‑weighted nutrient availability for a subsequent corn crop.
+5. Translate the nutrient state into economic loss (USD/ha) using the Mitscherlich‑Baule function.
+6. Demonstrate data assimilation by updating the topsoil nitrogen field with synthetic satellite observations via the EnKF.
+7. Generate publication‑ready heatmaps and LaTeX summary tables.
+
+```bash
+git clone https://github.com/mrphilo420/digital-twin-agriculture.git
+cd digital-twin-agriculture
+Rscript multivar-lattice.R
+```
+
+### Example Outputs
+
+| File | Description |
+|------|-------------|
+| `Figure1_3D_Volumetrics.png` | Heatmaps revealing the divergence between topsoil (0–20 cm) and subsoil (40–60 cm) nitrogen after three years. |
+| `Figure2_Economic_Loss.png` | Spatial map of USD/ha yield penalties for a subsequent corn crop. |
+| `Figure_Master_DigitalTwin.png` | Combined figure (volumetrics + economics) for publication. |
+
+Console output includes summary statistics (mean stress, max stress, Moran’s I, economic loss) and a LaTeX‑formatted table ready for inclusion in a manuscript.
+
+---
+
+## 📖 Mathematical Appendix & Citation
+
+Every algorithmic step in this codebase—from the continuous Advection‑Diffusion‑Reaction (ADR) PDE limit to the strict convexity of the economic response—is formally mathematically proven in the accompanying paper. For full details, please consult:
+
+> **Mandap, M. (2026).** *Multivariate Lattice Deformation: A Spatially Explicit Digital Twin for Predicting Nutrient Dynamics and Economic Risk in Heterogeneous Crop Rotations.* [Journal Name/Preprint Link].
+
+If you use this Digital Twin engine in your research, please cite the above manuscript.
+
+---
+
+## ⚠️ Performance Notes
+
+- The current settings (`X = 200`, `Y = 200`, `Z = 3`) run comfortably on a typical laptop (approx. 30 seconds per scenario).
+- For very large grids (> $500 \times 500$), the Moran’s I calculation in Section 8 becomes memory‑intensive. If you encounter memory issues, comment out that block or compute Moran’s I on a random subset of 1000 pixels.
+- The EnKF implementation is already memory‑safe and works for grids of any size.
+
+---
+
+## 📄 License
+
+This project is licensed under the MIT License – see the [LICENSE](LICENSE) file for details.
+
+---
+
+## 🤝 Contributing
+
+Contributions, issues, and feature requests are welcome! Feel free to open a pull request or an issue on GitHub.
+
+---
+
+## 🙏 Acknowledgments
+
+This work builds on foundational literature in spatial statistics, numerical analysis, and agronomy, including the seminal work of Evensen (2003) on the Ensemble Kalman Filter, Ripley (1981) on spatial statistics, and Paris (1974) on the Mitscherlich‑Baule response surface. The FFT convolution routines are powered by the excellent `imager` package by Simon Barthelme.
+
+---
+
+**Happy modeling!** 🌱
