@@ -1,4 +1,3 @@
-```markdown
 # Agricultural Digital Twin: 5D Spatiotemporal Soil Nutrient Engine
 
 [![R Status](https://img.shields.io/badge/R-4.0+-blue.svg)](https://cran.r-project.org/)
