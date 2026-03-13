@@ -1,5 +1,5 @@
 ```markdown
-# 🌾 Agricultural Digital Twin: 5D Spatiotemporal Soil Nutrient Engine
+# Agricultural Digital Twin: 5D Spatiotemporal Soil Nutrient Engine
 
 [![R Status](https://img.shields.io/badge/R-4.0+-blue.svg)](https://cran.r-project.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](https://opensource.org/licenses/MIT)
@@ -10,7 +10,7 @@ Unlike standard field‑averaged agronomic models, this physics‑inspired engin
 
 ---
 
-## ✨ Core Features (The 5 Theoretical Pillars)
+## Core Features (The 5 Theoretical Pillars)
 
 | Pillar | Description | Mathematical Foundation |
 |--------|-------------|--------------------------|
@@ -22,7 +22,7 @@ Unlike standard field‑averaged agronomic models, this physics‑inspired engin
 
 ---
 
-## 🚀 Installation & Dependencies
+## Installation & Dependencies
 
 The engine is built entirely in R. It relies on `imager` (C++ backend) for massive FFT speedups, allowing it to easily scale to high‑resolution farm grids (e.g., $1000 \times 1000$ pixels).
 
@@ -34,7 +34,7 @@ For the Ensemble Kalman Filter demonstration, the `MASS` package is required (al
 
 ---
 
-## 💻 Quickstart
+## Quickstart
 
 Clone the repository and run the master script. It will:
 
@@ -61,17 +61,6 @@ Rscript multivar-lattice.R
 | `Figure_Master_DigitalTwin.png` | Combined figure (volumetrics + economics) for publication. |
 
 Console output includes summary statistics (mean stress, max stress, Moran’s I, economic loss) and a LaTeX‑formatted table ready for inclusion in a manuscript.
-
----
-
-## 📖 Mathematical Appendix & Citation
-
-Every algorithmic step in this codebase—from the continuous Advection‑Diffusion‑Reaction (ADR) PDE limit to the strict convexity of the economic response—is formally mathematically proven in the accompanying paper. For full details, please consult:
-
-> **Mandap, M. (2026).** *Multivariate Lattice Deformation: A Spatially Explicit Digital Twin for Predicting Nutrient Dynamics and Economic Risk in Heterogeneous Crop Rotations.* [Journal Name/Preprint Link].
-
-If you use this Digital Twin engine in your research, please cite the above manuscript.
-
 ---
 
 ## ⚠️ Performance Notes
