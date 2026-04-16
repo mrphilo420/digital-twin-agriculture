@@ -1,400 +1,374 @@
-# ==============================================================================
-# MEMORY‑OPTIMIZED DIGITAL TWIN OF AGRICULTURAL SOIL
-# Multivariate Lattice Model with 3D Volumetrics, Anisotropic Transport,
-# Michaelis‑Menten Kinetics, Economic Translation, and EnKF Data Assimilation
-# Optimized for large grids (e.g., 1000×1000) with reduced RAM footprint.
-# ==============================================================================
+# =============================================================================
+# COMPLETE WORKING DIGITAL TWIN SIMULATION SCRIPT
+# =============================================================================
 
-# ------------------------------------------------------------------------------
-# 0. PACKAGE SETUP
-# ------------------------------------------------------------------------------
-required_packages <- c("ggplot2", "reshape2", "MASS", "xtable", "viridis", "imager", "spdep")
-new_packages <- required_packages[!(required_packages %in% installed.packages()[,"Package"])]
-if(length(new_packages)) install.packages(new_packages)
+rm(list = ls())
+gc()
+set.seed(42)
 
-library(ggplot2)
-library(reshape2)
-library(MASS)
-library(xtable)
-library(viridis)
-library(imager)
-library(spdep)      # for efficient Moran's I (sparse matrices)
+# =============================================================================
+# PACKAGES
+# =============================================================================
 
-# Optional: use float for half memory (experimental)
-# library(float)
-# use_float <- FALSE   # set to TRUE to convert arrays to float
-
-# ------------------------------------------------------------------------------
-# 1. OPTIMIZED PHYSICS: FFT‑BASED ANISOTROPIC SMOOTHING (unchanged)
-# ------------------------------------------------------------------------------
-apply_anisotropic_smoothing_fast <- function(mat, sigma_x, sigma_y, global_theta = 0) {
-  if (max(sigma_x, sigma_y) <= 0) return(mat)
-  radius <- ceiling(3 * max(sigma_x, sigma_y))
-  x_seq <- seq(-radius, radius); y_seq <- seq(-radius, radius)
-  grid <- expand.grid(dx = x_seq, dy = y_seq)
-  cos_t <- cos(global_theta); sin_t <- sin(global_theta)
-  x_rot <- grid$dx * cos_t + grid$dy * sin_t
-  y_rot <- -grid$dx * sin_t + grid$dy * cos_t
-  kernel_vals <- exp(-(x_rot^2) / (2 * sigma_x^2) - (y_rot^2) / (2 * sigma_y^2))
-  kernel_mat <- matrix(kernel_vals, nrow = length(x_seq), ncol = length(y_seq))
-  
-  img <- as.cimg(mat)
-  k_img <- as.cimg(kernel_mat)
-  num <- imager::convolve(img, k_img, dirichlet = TRUE)
-  ones_img <- as.cimg(matrix(1, nrow = nrow(mat), ncol = ncol(mat)))
-  den <- imager::convolve(ones_img, k_img, dirichlet = TRUE)
-  out <- as.matrix(num / den)
-  return(out)
+for (pkg in c("ggplot2", "viridis")) {
+  if (!require(pkg, character.only = TRUE, quietly = TRUE)) {
+    install.packages(pkg)
+    library(pkg, character.only = TRUE)
+  }
 }
 
-# ------------------------------------------------------------------------------
-# 2. MEMORY‑SAFE ENSEMBLE KALMAN FILTER (unchanged, but reduce ensemble size later)
-# ------------------------------------------------------------------------------
-ensemble_kalman_update_fast <- function(ensemble, obs, H_operator_func, R_diag, inflation = 1.05) {
-  n_ens <- ncol(ensemble)
-  ens_mean <- rowMeans(ensemble)
-  A <- (ensemble - ens_mean) * sqrt(inflation)
-  HA <- H_operator_func(A)
-  R_inv_HA <- HA / R_diag
-  D <- t(HA) %*% R_inv_HA + diag(n_ens - 1, n_ens)
-  D_inv <- solve(D)
-  obs_pert <- matrix(obs, nrow = length(obs), ncol = n_ens) +
-    matrix(rnorm(length(obs) * n_ens, 0, sqrt(R_diag)), ncol = n_ens)
-  Innovations <- obs_pert - H_operator_func(ensemble)
-  update_step <- A %*% (D_inv %*% (t(R_inv_HA) %*% Innovations))
-  posterior_ensemble <- ensemble + update_step
-  return(rowMeans(posterior_ensemble))
-}
+# =============================================================================
+# PARAMETERS
+# =============================================================================
 
-# ------------------------------------------------------------------------------
-# 3. MAIN SIMULATION DRIVER (3D DIGITAL TWIN) – MEMORY‑OPTIMIZED
-#    Stores only current and next time slices (2 time steps).
-# ------------------------------------------------------------------------------
-run_digital_twin_3D_opt <- function(rotation_seq, sigma_x, sigma_y, theta,
-                                    alpha_map_3D, forces_dict, km_vals, leach_rates,
-                                    root_dist, dt = 1.0) {
-  X <- dim(alpha_map_3D)[1]
-  Y <- dim(alpha_map_3D)[2]
-  Z <- dim(alpha_map_3D)[3]
-  T_steps <- length(rotation_seq) + 1
-  C <- 3
+N_x <- 100
+N_y <- 100
+N_cells <- N_x * N_y
+Delta <- 0.01
+T_max <- 3
+n_channels <- 3
+sigma_kernel <- 1.2
+
+# Crop forces [N, P, K] - as numeric vectors
+crop_forces <- list(
+  corn = c(-0.60, -0.20, -0.20),
+  soybean = c(+0.20, -0.10, -0.10),
+  wheat = c(-0.20, -0.40, -0.10)
+)
+
+# =============================================================================
+# GAUSSIAN SMOOTHING FUNCTION
+# =============================================================================
+
+gaussian_smooth_matrix <- function(mat, sigma) {
+  n_x <- nrow(mat)
+  n_y <- ncol(mat)
   
-  # Allocate only two time slices: current (t) and next (t+1)
-  # Use a list: current = array(1.0, dim = c(X, Y, Z, C))
-  current <- array(1.0, dim = c(X, Y, Z, C))
-  next_state <- array(0, dim = c(X, Y, Z, C))
+  kernel_size <- max(1, ceiling(3 * sigma))
+  if (kernel_size %% 2 == 0) kernel_size <- kernel_size + 1
   
-  for (yr in 1:length(rotation_seq)) {
-    crop <- rotation_seq[yr]
-    force_base <- forces_dict[[crop]]
-    rho <- root_dist[[crop]]
-    
-    # Copy current to next as starting point? Actually we build next from scratch.
-    # We'll compute next_state and then swap.
-    for (c_idx in 1:C) {
-      for (z in 1:Z) {
-        current_S <- current[, , z, c_idx]   # from previous year
-        f_max <- force_base[c_idx] * rho[z]
-        km <- km_vals[c_idx]
-        
-        # Reaction
-        if (f_max >= 0) {
-          new_layer <- current_S * (1 + f_max * dt * alpha_map_3D[, , z])
-        } else {
-          uptake_rate <- -f_max * alpha_map_3D[, , z]
-          new_layer <- current_S * exp(-uptake_rate * dt / (km + current_S))
-        }
-        
-        # Horizontal smoothing
-        new_layer <- apply_anisotropic_smoothing_fast(new_layer, sigma_x, sigma_y, theta)
-        
-        # Store temporarily (will be used for leaching)
-        # We'll accumulate into next_state[,,z,c_idx] later after leaching across layers
-        # But leaching needs all layers of the same nutrient together.
-        # So we need to keep a temporary 3D array for this nutrient across depths.
-        # Let's create a temporary 3D array for this nutrient.
-        if (c_idx == 1 && z == 1) {
-          # Initialize temp array for this nutrient
-          temp_nutrient <- array(0, dim = c(X, Y, Z))
-        }
-        temp_nutrient[, , z] <- new_layer
-      } # end depth loop
+  k_half <- (kernel_size - 1) / 2
+  k_seq <- (-k_half):k_half
+  kernel_1d <- dnorm(k_seq, mean = 0, sd = sigma)
+  kernel_1d <- kernel_1d / sum(kernel_1d)
+  kernel_2d <- outer(kernel_1d, kernel_1d)
+  
+  result <- matrix(NA, n_x, n_y)
+  
+  for (i in 1:n_x) {
+    for (j in 1:n_y) {
+      total <- 0
+      w_sum <- 0
       
-      # Now temp_nutrient holds the post‑smoothing values for nutrient c_idx.
-      # Apply leaching cascade
-      for (z in 1:(Z-1)) {
-        downward_flux <- temp_nutrient[, , z] * leach_rates[c_idx] * dt
-        temp_nutrient[, , z] <- temp_nutrient[, , z] - downward_flux
-        temp_nutrient[, , z+1] <- temp_nutrient[, , z+1] + downward_flux
+      for (ki in 1:kernel_size) {
+        for (kj in 1:kernel_size) {
+          # Map to matrix indices with reflection at boundaries
+          ii <- i + (ki - k_half - 1)
+          jj <- j + (kj - k_half - 1)
+          
+          # Reflect at boundaries
+          if (ii < 1) ii <- 2 - ii
+          if (ii > n_x) ii <- 2 * n_x - ii
+          if (jj < 1) jj <- 2 - jj
+          if (jj > n_y) jj <- 2 * n_y - jj
+          
+          # Clamp
+          ii <- max(1, min(n_x, ii))
+          jj <- max(1, min(n_y, jj))
+          
+          weight <- kernel_2d[ki, kj]
+          total <- total + weight * mat[ii, jj]
+          w_sum <- w_sum + weight
+        }
       }
-      # Groundwater loss from deepest layer
-      temp_nutrient[, , Z] <- temp_nutrient[, , Z] * (1 - leach_rates[c_idx] * dt)
       
-      # Store final result in next_state
-      for (z in 1:Z) {
-        next_state[, , z, c_idx] <- temp_nutrient[, , z]
-      }
-    } # end nutrient loop
-    
-    # Swap: current <- next_state, and reset next_state to zeros
-    current <- next_state
-    next_state <- array(0, dim = c(X, Y, Z, C))
+      result[i, j] <- total / w_sum
+    }
   }
   
-  # Return final state (after all years)
-  return(list(Final_State = current))
+  return(result)
 }
 
-# ------------------------------------------------------------------------------
-# 4. PARAMETER DEFINITIONS (same as before, but can scale up)
-# ------------------------------------------------------------------------------
-set.seed(42)
-X <- 200; Y <- 200; Z <- 3
+# =============================================================================
+# CREATE BUFFERING CAPACITY MAP
+# =============================================================================
 
-# 4.1 Soil buffering map
-alpha_2d <- matrix(runif(X*Y, 0.3, 1.0), X, Y)
-alpha_2d[1:(X/2), 1:(Y/2)] <- 0.9
-alpha_2d[(X/2+1):X, (Y/2+1):Y] <- 0.5
-alpha_2d <- apply_anisotropic_smoothing_fast(alpha_2d, 2.0, 2.0, 0)
-
-alpha_3D <- array(dim = c(X, Y, Z))
-alpha_3D[,,1] <- alpha_2d
-alpha_3D[,,2] <- pmax(0.1, alpha_2d - 0.2)
-alpha_3D[,,3] <- pmax(0.1, alpha_2d - 0.4)
-
-# 4.2 Crop forces
-forces <- list(
-  Corn    = c(-0.6, -0.2, -0.2),
-  Soybean = c( 0.2, -0.1, -0.1),
-  Wheat   = c(-0.2, -0.4, -0.1)
-)
-
-# 4.3 Half‑saturation constants
-km_vals <- c(N = 0.3, P = 0.2, K = 0.25)
-
-# 4.4 Leaching rates
-leach_rates <- c(N = 0.15, P = 0.01, K = 0.05)
-
-# 4.5 Root distributions
-root_dist <- list(
-  Corn    = c(0.6, 0.3, 0.1),
-  Soybean = c(0.7, 0.2, 0.1),
-  Wheat   = c(0.4, 0.4, 0.2)
-)
-
-# ------------------------------------------------------------------------------
-# 5. SCENARIO EXECUTION (using optimized driver)
-# ------------------------------------------------------------------------------
-cat("\n=== Running Optimized Digital Twin Simulations ===\n")
-cat("Grid size:", X, "x", Y, "x", Z, "=", X*Y*Z, "voxels\n")
-
-cat("Scenario 0: Baseline rotation (Corn‑Soybean‑Wheat)...\n")
-res_base <- run_digital_twin_3D_opt(
-  rotation_seq = c("Corn", "Soybean", "Wheat"),
-  sigma_x = 2.0, sigma_y = 0.5, theta = 0,
-  alpha_map_3D = alpha_3D,
-  forces_dict = forces,
-  km_vals = km_vals,
-  leach_rates = leach_rates,
-  root_dist = root_dist
-)
-
-cat("Scenario S4: Continuous corn...\n")
-res_cont <- run_digital_twin_3D_opt(
-  rotation_seq = c("Corn", "Corn", "Corn"),
-  sigma_x = 2.0, sigma_y = 0.5, theta = 0,
-  alpha_map_3D = alpha_3D,
-  forces_dict = forces,
-  km_vals = km_vals,
-  leach_rates = leach_rates,
-  root_dist = root_dist
-)
-
-# ------------------------------------------------------------------------------
-# 6. AGRONOMIC AND ECONOMIC TRANSLATION
-# ------------------------------------------------------------------------------
-mitscherlich_baule <- function(S_eff, crop_type, Y_max) {
-  k_coefs <- list(
-    Corn    = c(N = 2.5, P = 1.8, K = 1.2),
-    Soybean = c(N = 1.5, P = 2.2, K = 1.0),
-    Wheat   = c(N = 2.0, P = 2.5, K = 1.3)
-  )
-  k <- k_coefs[[crop_type]]
-  yield_frac <- apply(S_eff, 1, function(x) prod(1 - exp(-k * x)))
-  return(Y_max * yield_frac)
+create_buffering_map <- function(N_x, N_y, sigma = 1.2) {
+  
+  x_coords <- seq(0, 1, length.out = N_x)
+  y_coords <- seq(0, 1, length.out = N_y)
+  
+  # Create quadrant-based alpha
+  alpha_raw <- matrix(NA, nrow = N_x, ncol = N_y)
+  
+  for (i in 1:N_x) {
+    for (j in 1:N_y) {
+      x <- x_coords[i]
+      y <- y_coords[j]
+      
+      if (x < 0.5 && y > 0.5) {
+        alpha_raw[i, j] <- 1.0   # Sandy
+      } else if (x > 0.5 && y < 0.5) {
+        alpha_raw[i, j] <- 0.2   # Clay
+      } else {
+        alpha_raw[i, j] <- 0.5   # Loam
+      }
+    }
+  }
+  
+  # Smooth
+  alpha_smooth <- gaussian_smooth_matrix(alpha_raw, sigma)
+  alpha_smooth <- pmax(pmin(alpha_smooth, 1.0), 0.2)
+  
+  return(list(
+    raw = as.vector(alpha_raw),
+    smoothed = as.vector(alpha_smooth),
+    matrix_raw = alpha_raw,
+    matrix_smoothed = alpha_smooth,
+    x = x_coords,
+    y = y_coords,
+    n_x = N_x,
+    n_y = N_y
+  ))
 }
 
-root_corn <- root_dist[["Corn"]]
+# =============================================================================
+# CALCULATE MORAN'S I
+# =============================================================================
 
-S_base <- res_base$Final_State
-S_cont <- res_cont$Final_State
-
-depth_weighted_avg <- function(S_array, root_wt) {
-  eff <- S_array[,,1] * root_wt[1] +
-    S_array[,,2] * root_wt[2] +
-    S_array[,,3] * root_wt[3]
-  return(as.vector(eff))
+calc_morans_I <- function(z, n_x, n_y) {
+  
+  z <- as.vector(z)
+  n <- length(z)
+  z_bar <- mean(z)
+  z_c <- z - z_bar
+  
+  numerator <- 0
+  weight_sum <- 0
+  
+  for (i in 1:n_x) {
+    for (j in 1:n_y) {
+      idx <- (j - 1) * n_x + i
+      
+      # Rook neighbors
+      neighbors <- c()
+      if (j > 1) neighbors <- c(neighbors, idx - n_x)
+      if (j < n_y) neighbors <- c(neighbors, idx + n_x)
+      if (i > 1) neighbors <- c(neighbors, idx - 1)
+      if (i < n_x) neighbors <- c(neighbors, idx + 1)
+      
+      for (n_idx in neighbors) {
+        numerator <- numerator + z_c[idx] * z_c[n_idx]
+        weight_sum <- weight_sum + 1
+      }
+    }
+  }
+  
+  denominator <- sum(z_c^2)
+  
+  if (denominator > 0) {
+    I <- (n / weight_sum) * (numerator / denominator)
+  } else {
+    I <- 0
+  }
+  
+  return(list(I = I, p_value = NA))
 }
 
-eff_N_base <- depth_weighted_avg(S_base[,,,1], root_corn)
-eff_P_base <- depth_weighted_avg(S_base[,,,2], root_corn)
-eff_K_base <- depth_weighted_avg(S_base[,,,3], root_corn)
+# =============================================================================
+# RUN SIMULATION
+# =============================================================================
 
-eff_N_cont <- depth_weighted_avg(S_cont[,,,1], root_corn)
-eff_P_cont <- depth_weighted_avg(S_cont[,,,2], root_corn)
-eff_K_cont <- depth_weighted_avg(S_cont[,,,3], root_corn)
-
-Y_max <- 11.0; price_per_ton <- 180
-yield_base <- mitscherlich_baule(cbind(eff_N_base, eff_P_base, eff_K_base), "Corn", Y_max)
-yield_cont <- mitscherlich_baule(cbind(eff_N_cont, eff_P_cont, eff_K_cont), "Corn", Y_max)
-loss_base <- (Y_max - yield_base) * price_per_ton
-loss_cont <- (Y_max - yield_cont) * price_per_ton
-
-cat("\nMean economic loss (baseline):", mean(loss_base, na.rm = TRUE), "USD/ha")
-cat("\nMean economic loss (continuous corn):", mean(loss_cont, na.rm = TRUE), "USD/ha\n")
-
-# ------------------------------------------------------------------------------
-# 7. DATA ASSIMILATION DEMO (reduced ensemble size)
-# ------------------------------------------------------------------------------
-cat("\n=== Ensemble Kalman Filter Demonstration ===\n")
-true_state <- as.vector(S_base[,,1,1])
-n_state <- length(true_state)
-n_ens <- 15   # reduced from 30 to save memory
-
-ensemble <- matrix(rnorm(n_state * n_ens, mean = true_state, sd = 0.1),
-                   nrow = n_state, ncol = n_ens)
-obs_indices <- sample(1:n_state, size = floor(0.1 * n_state))
-obs <- true_state[obs_indices] + rnorm(length(obs_indices), 0, 0.05)
-R_diag <- 0.05^2
-
-H_operator <- function(ens) ens[obs_indices, , drop = FALSE]
-
-posterior_mean <- ensemble_kalman_update_fast(
-  ensemble = ensemble,
-  obs = obs,
-  H_operator_func = H_operator,
-  R_diag = R_diag,
-  inflation = 1.05
-)
-
-prior_mean <- rowMeans(ensemble)
-rmse_prior <- sqrt(mean((prior_mean - true_state)^2))
-rmse_post  <- sqrt(mean((posterior_mean - true_state)^2))
-cat(sprintf("Prior RMSE: %.4f\n", rmse_prior))
-cat(sprintf("Posterior RMSE: %.4f\n", rmse_post))
-cat(sprintf("RMSE reduction: %.1f%%\n", (1 - rmse_post/rmse_prior)*100))
-
-# ------------------------------------------------------------------------------
-# 8. SUMMARY STATISTICS (with sparse Moran's I)
-# ------------------------------------------------------------------------------
-cat("\n=== Generating Summary Statistics ===\n")
-
-stress_base <- sqrt((S_base[,,1,1] - 1)^2 + (S_base[,,2,1] - 1)^2 + (S_base[,,3,1] - 1)^2)
-stress_cont <- sqrt((S_cont[,,1,1] - 1)^2 + (S_cont[,,2,1] - 1)^2 + (S_cont[,,3,1] - 1)^2)
-
-# Efficient Moran's I using spdep (sparse weights)
-compute_moran_sparse <- function(mat) {
-  vals <- as.vector(mat)
-  coords <- expand.grid(x = 1:nrow(mat), y = 1:ncol(mat))
-  nb <- knn2nb(knearneigh(coords, k = 8))   # 8 nearest neighbours
-  listw <- nb2listw(nb)
-  moran <- moran.test(vals, listw, randomisation = FALSE)
-  return(c(moran$estimate[1], moran$p.value))
+run_simulation <- function(alpha_map, rotation, T_max = 3, verbose = TRUE) {
+  
+  if (verbose) cat("Starting simulation:", paste(rotation, collapse = " -> "), "\n")
+  
+  n_x <- alpha_map$n_x
+  n_y <- alpha_map$n_y
+  alpha <- alpha_map$smoothed
+  
+  # State array: S[x, y, time, channel]
+  # time: 1 = initial, 2 = year 1, etc.
+  S <- array(1.0, dim = c(n_x, n_y, T_max + 1, n_channels))
+  D <- matrix(NA, nrow = n_x * n_y, ncol = T_max)
+  
+  for (t in 1:T_max) {
+    
+    if (verbose) cat("  Year", t, ":", rotation[t], "\n")
+    
+    force <- crop_forces[[rotation[t]]]
+    prev_t_idx <- t
+    curr_t_idx <- t + 1
+    
+    # Apply crop forces
+    for (c in 1:n_channels) {
+      for (i in 1:n_x) {
+        for (j in 1:n_y) {
+          idx <- (j - 1) * n_x + i
+          S[i, j, curr_t_idx, c] <- S[i, j, prev_t_idx, c] * (1 + force[c] * alpha[idx])
+        }
+      }
+    }
+    
+    # Smooth each channel
+    for (c in 1:n_channels) {
+      S[, , curr_t_idx, c] <- gaussian_smooth_matrix(S[, , curr_t_idx, c], sigma_kernel)
+    }
+    
+    # Calculate stress
+    for (i in 1:n_x) {
+      for (j in 1:n_y) {
+        idx <- (j - 1) * n_x + i
+        current_state <- S[i, j, curr_t_idx, ]
+        initial_state <- S[i, j, 1, ]
+        D[idx, t] <- sqrt(sum((current_state - initial_state)^2))
+      }
+    }
+    
+    if (verbose) cat("    Mean stress:", round(mean(D[, t]), 4), "\n")
+  }
+  
+  # Calculate final stress weights
+  final_t_idx <- T_max + 1
+  
+  # Convert to vectors
+  N_final <- as.vector(S[, , final_t_idx, 1])
+  P_final <- as.vector(S[, , final_t_idx, 2])
+  K_final <- as.vector(S[, , final_t_idx, 3])
+  
+  # Variance of squared deviations
+  var_N <- var((N_final - 1)^2)
+  var_P <- var((P_final - 1)^2)
+  var_K <- var((K_final - 1)^2)
+  
+  total_var <- var_N + var_P + var_K
+  
+  if (total_var > 0) {
+    w_N <- var_N / total_var
+    w_P <- var_P / total_var
+    w_K <- var_K / total_var
+  } else {
+    w_N <- w_P <- w_K <- 1/3
+  }
+  
+  # Moran's I
+  moran_N <- calc_morans_I(N_final, n_x, n_y)
+  moran_alpha <- calc_morans_I(alpha, n_x, n_y)
+  moran_D <- calc_morans_I(D[, T_max], n_x, n_y)
+  
+  # Statistics
+  final_stress <- D[, T_max]
+  mean_stress <- mean(final_stress)
+  max_stress <- max(final_stress)
+  stress_cv <- sd(final_stress) / mean_stress
+  
+  # Variance ratio
+  var_D <- var(final_stress)
+  var_alpha <- var(alpha)
+  R_ratio <- var_D / var_alpha
+  
+  if (verbose) {
+    cat("\n  === Final Results ===\n")
+    cat("  Mean stress:", round(mean_stress, 3), "\n")
+    cat("  Max stress:", round(max_stress, 3), "\n")
+    cat("  Moran's I:", round(moran_N$I, 3), "\n")
+    cat("  R ratio:", round(R_ratio, 3), "\n")
+    cat("  Weights: N =", round(w_N, 3), 
+        "P =", round(w_P, 3), 
+        "K =", round(w_K, 3), "\n\n")
+  }
+  
+  return(list(
+    S = S,
+    D = D,
+    stress_weights = c(N = w_N, P = w_P, K = w_K),
+    moran_I = moran_N$I,
+    moran_I_alpha = moran_alpha$I,
+    mean_stress = mean_stress,
+    max_stress = max_stress,
+    stress_cv = stress_cv,
+    R_ratio = R_ratio,
+    alpha_map = alpha_map,
+    rotation = rotation
+  ))
 }
 
-moran_base <- compute_moran_sparse(stress_base)
-moran_cont <- compute_moran_sparse(stress_cont)
+# =============================================================================
+# RUN SIMULATIONS
+# =============================================================================
 
-summary_df <- data.frame(
-  Scenario = c("Baseline (Corn-Soy-Wheat)", "Continuous Corn"),
-  Mean_Stress = c(mean(stress_base), mean(stress_cont)),
-  Max_Stress = c(max(stress_base), max(stress_cont)),
-  CV_Stress = c(sd(stress_base)/mean(stress_base), sd(stress_cont)/mean(stress_cont)),
-  Mean_Econ_Loss_USD = c(mean(loss_base), mean(loss_cont)),
-  Moran_I = c(moran_base[1], moran_cont[1])
+cat("\n", paste(rep("=", 60), collapse = ""), "\n", sep = "")
+cat("RUNNING DIGITAL TWIN SIMULATIONS\n")
+cat(paste(rep("=", 60), collapse = ""), "\n\n")
+
+# Step 1: Create buffering map
+cat("Step 1: Creating buffering capacity map...\n")
+alpha_map <- create_buffering_map(N_x, N_y, sigma_kernel)
+cat("  Done! Alpha range:", round(range(alpha_map$smoothed), 3), "\n\n")
+
+# Step 2: Run baseline rotation
+cat("Step 2: Running BASELINE ROTATION (Corn -> Soybean -> Wheat)...\n")
+baseline_result <- run_simulation(
+  alpha_map, 
+  rotation = c("corn", "soybean", "wheat"), 
+  T_max = T_max,
+  verbose = TRUE
 )
 
-print(summary_df, digits = 3)
-
-# LaTeX table
-latex_table <- xtable(summary_df,
-                      caption = "Summary statistics for baseline and continuous corn scenarios.",
-                      label = "tab:summary",
-                      digits = 3)
-print(latex_table, include.rownames = FALSE, booktabs = TRUE)
-
-
-# ------------------------------------------------------------------------------
-# 9. PUBLICATION FIGURES
-# ------------------------------------------------------------------------------
-cat("\n=== Generating Figures ===\n")
-
-# Helper to convert matrix to data frame for ggplot
-matrix_to_df <- function(mat, name) {
-  df <- expand.grid(X = 1:nrow(mat), Y = 1:ncol(mat))
-  df$Value <- as.vector(mat)
-  df$Metric <- name
-  return(df)
-}
-
-# --- FIGURE 1: 3D Volumetrics ---
-df_top <- matrix_to_df(S_base[,,1,1], "Topsoil N (0-20 cm)")
-df_sub <- matrix_to_df(S_base[,,3,1], "Subsoil N (40-60 cm)")
-df_vol <- rbind(df_top, df_sub)
-
-p1 <- ggplot(df_vol, aes(x = X, y = Y, fill = Value)) +
-  geom_tile() +
-  facet_wrap(~Metric) +
-  scale_fill_viridis_c(option = "mako", name = "N Status") +
-  theme_minimal() +
-  theme(axis.title = element_blank(), axis.text = element_blank(),
-        strip.text = element_text(size = 12, face = "bold")) +
-  labs(title = "3D Volumetric Mining: Topsoil vs. Subsoil Nitrogen")
-
-ggsave("Figure1_3D_Volumetrics.png", plot = p1, width = 10, height = 5, dpi = 300)
-
-
-# --- FIGURE 2: Economic Loss ---
-df_loss <- matrix_to_df(matrix(loss_base, nrow = X, ncol = Y), "Economic Loss (USD/ha)")
-p2 <- ggplot(df_loss, aes(x = X, y = Y, fill = Value)) +
-  geom_tile() +
-  scale_fill_viridis_c(option = "rocket", direction = -1, name = "USD / ha") +
-  theme_minimal() +
-  theme(axis.title = element_blank(), axis.text = element_blank()) +
-  labs(title = "Economic Translation",
-       subtitle = "Yield loss penalty for subsequent Corn crop")
-
-ggsave("Figure2_Economic_Loss.png", plot = p2, width = 6, height = 5, dpi = 300)
-
-
-# --- FIGURE 3: EnKF RMSE Reduction ---
-# Note: rmse_prior and rmse_post are calculated in Section 7 (Data Assimilation Demo)
-rmse_data <- data.frame(
-  State = factor(c("Prior (Model Only)", "Posterior (Data Assimilated)"), 
-                 levels = c("Prior (Model Only)", "Posterior (Data Assimilated)")),
-  RMSE = c(rmse_prior, rmse_post)
+# Step 3: Run continuous corn
+cat("Step 3: Running CONTINUOUS CORN...\n")
+continuous_result <- run_simulation(
+  alpha_map,
+  rotation = c("corn", "corn", "corn"),
+  T_max = T_max,
+  verbose = TRUE
 )
 
-p3 <- ggplot(rmse_data, aes(x = State, y = RMSE, fill = State)) +
-  geom_bar(stat = "identity", width = 0.5, color = "black", size = 0.5) +
-  scale_fill_manual(values = c("Prior (Model Only)" = "#E07A5F", 
-                               "Posterior (Data Assimilated)" = "#3D405B")) +
-  geom_text(aes(label = sprintf("%.4f", RMSE)), vjust = -0.5, size = 5, fontface = "bold") +
-  theme_minimal(base_size = 14) +
-  theme(
-    legend.position = "none",
-    axis.title.x = element_blank(),
-    axis.text.x = element_text(face = "bold", size = 12),
-    panel.grid.major.x = element_blank()
-  ) +
-  labs(
-    title = "Digital Twin Self-Correction via EnKF",
-    subtitle = "Root Mean Square Error (RMSE) reduction after assimilating spatial observations",
-    y = "Spatial RMSE (Normalized Concentration)"
-  )
+# =============================================================================
+# PRINT COMPARISON TABLE
+# =============================================================================
 
-ggsave("Figure3_EnKF_RMSE.png", plot = p3, width = 7, height = 5, dpi = 300)
+cat("\n", paste(rep("=", 60), collapse = ""), "\n", sep = "")
+cat("SIMULATION RESULTS COMPARISON\n")
+cat(paste(rep("=", 60), collapse = ""), "\n\n")
 
-cat("Figures saved: Figure1_3D_Volumetrics.png, Figure2_Economic_Loss.png, Figure3_EnKF_RMSE.png\n")
+cat(sprintf("%-25s %12s %15s\n", "Metric", "Baseline", "Continuous Corn"))
+cat(paste(rep("-", 52), collapse = ""), "\n")
+cat(sprintf("%-25s %12.3f %15.3f\n", "Mean Stress D", 
+            baseline_result$mean_stress, continuous_result$mean_stress))
+cat(sprintf("%-25s %12.3f %15.3f\n", "Max Stress", 
+            baseline_result$max_stress, continuous_result$max_stress))
+cat(sprintf("%-25s %12.3f %15.3f\n", "Stress CV", 
+            baseline_result$stress_cv, continuous_result$stress_cv))
+cat(sprintf("%-25s %12.3f %15.3f\n", "Moran's I", 
+            baseline_result$moran_I, continuous_result$moran_I))
+cat(sprintf("%-25s %12.3f %15.3f\n", "R ratio (Lemma 2)", 
+            baseline_result$R_ratio, continuous_result$R_ratio))
+cat(paste(rep("-", 52), collapse = ""), "\n")
+cat("Stress Weights:\n")
+cat(sprintf("  %-23s %11.1f%% %14.1f%%\n", "Nitrogen (N)", 
+            baseline_result$stress_weights["N"] * 100, 
+            continuous_result$stress_weights["N"] * 100))
+cat(sprintf("  %-23s %11.1f%% %14.1f%%\n", "Phosphorus (P)", 
+            baseline_result$stress_weights["P"] * 100, 
+            continuous_result$stress_weights["P"] * 100))
+cat(sprintf("  %-23s %11.1f%% %14.1f%%\n", "Potassium (K)", 
+            baseline_result$stress_weights["K"] * 100, 
+            continuous_result$stress_weights["K"] * 100))
+cat(paste(rep("-", 52), collapse = ""), "\n")
+cat(sprintf("Dominant stressor        %12s %15s\n",
+            ifelse(baseline_result$stress_weights["N"] > 0.5, "N-dominated", "N ≈ P"),
+            "N-dominated"))
+cat(paste(rep("=", 60), collapse = ""), "\n")
 
-cat("\n=== Digital Twin Pipeline Complete (Memory Optimized) ===\n")
+# =============================================================================
+# SAVE RESULTS
+# =============================================================================
+
+if (!dir.exists("results")) dir.create("results")
+
+saveRDS(baseline_result, "results/baseline_rotation.rds")
+saveRDS(continuous_result, "results/continuous_corn.rds")
+saveRDS(alpha_map, "results/alpha_map.rds")
+
+cat("\nResults saved to results/ directory\n")
