@@ -1,4 +1,3 @@
-```markdown
 # Multivariate Lattice Digital Twin for Agricultural Soil Nutrient Dynamics
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
@@ -341,6 +340,3 @@ Simulations were performed on Bulacan State University using R version 4.4.3.
   
 **Last Updated**: May 2026  
 **Status**: ✅ Active Development | 📝 Under Review
-
-</div>
-```
